@@ -1,0 +1,48 @@
+name: Deploy to Production
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'   # triggers on tags like v1.0.0, v2.3.1
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+    environment: production    # requires manual approval in GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
+
+      - name: Authenticate to Production org
+        run: |
+          echo "${{ secrets.SALESFORCE_PROD_JWT_KEY }}" > jwt.key
+          sf org login jwt \
+            --client-id ${{ secrets.SALESFORCE_PROD_CLIENT_ID }} \
+            --jwt-key-file jwt.key \
+            --username ${{ secrets.SALESFORCE_PROD_USERNAME }} \
+            --instance-url https://login.salesforce.com \
+            --alias prod-org \
+            --set-default
+          rm jwt.key
+
+      - name: Deploy to Production
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --target-org prod-org \
+            --wait 60 \
+            --test-level RunLocalTests
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false

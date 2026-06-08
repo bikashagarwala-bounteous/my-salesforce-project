@@ -1,0 +1,91 @@
+name: PR Quality Check
+
+on:
+  pull_request:
+    branches: [development]
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
+
+      - name: Install Code Analyzer plugin
+        run: sf plugins install @salesforce/sfdx-scanner@latest
+
+      - name: Authenticate to Salesforce
+        run: |
+          echo "${{ secrets.SALESFORCE_JWT_KEY }}" > jwt.key
+          sf org login jwt \
+            --client-id ${{ secrets.SALESFORCE_CLIENT_ID }} \
+            --jwt-key-file jwt.key \
+            --username ${{ secrets.SALESFORCE_USERNAME }} \
+            --instance-url https://login.salesforce.com \
+            --alias target-org \
+            --set-default
+          rm jwt.key
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            **/*.cls
+            **/*.trigger
+            **/*.js
+            **/*.html
+
+      - name: Run Code Analyzer
+        if: steps.changed-files.outputs.any_changed == 'true'
+        id: scan
+        continue-on-error: true
+        run: |
+          FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          FORMATTED=$(echo "$FILES" | tr ' ' ',')
+          sf scanner run \
+            --target "$FORMATTED" \
+            --outfile results_raw.json \
+            --format json
+          # Filter + count (same logic as your existing workflow)
+          jq '...' results_raw.json > results.json
+          echo "violations=$(jq '.violationCounts.total' results.json)" >> $GITHUB_OUTPUT
+
+      - name: Run Apex Tests & Check Coverage
+        id: test
+        run: |
+          sf apex run test \
+            --target-org target-org \
+            --result-format json \
+            --output-dir test-results \
+            --wait 30 \
+            --code-coverage
+          
+          # Extract coverage percentage
+          COVERAGE=$(jq '.result.summary.testRunCoverage' \
+            test-results/test-run-*-codecoverage.json \
+            | tr -d '"' | tr -d '%')
+          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          
+          # Fail if below 75% (Salesforce minimum)
+          if (( $(echo "$COVERAGE < 75" | bc -l) )); then
+            echo "❌ Coverage $COVERAGE% is below 75% minimum"
+            exit 1
+          fi
+          echo "✅ Coverage: $COVERAGE%"
+
+      - name: Summary
+        run: |
+          echo "## PR Quality Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Code violations | ${{ steps.scan.outputs.violations }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test coverage | ${{ steps.test.outputs.coverage }}% |" >> $GITHUB_STEP_SUMMARY
