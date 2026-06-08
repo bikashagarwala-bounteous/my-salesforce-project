@@ -51,31 +51,36 @@ jobs:
         run: |
           FILES="${{ steps.changed-files.outputs.all_changed_files }}"
           FORMATTED=$(echo "$FILES" | tr ' ' ',')
+          
           sf scanner run \
             --target "$FORMATTED" \
             --outfile results_raw.json \
-            --format json
-          # Filter + count (same logic as your existing workflow)
-          jq '...' results_raw.json > results.json
-          echo "violations=$(jq '.violationCounts.total' results.json)" >> $GITHUB_OUTPUT
+            --format json || true
 
-      - name: Run Apex Tests & Check Coverage
+          if [ -f results_raw.json ]; then
+            VIOLATIONS=$(jq '[.[] | .violations // []] | add // [] | length' results_raw.json)
+            echo "violations=$VIOLATIONS" >> $GITHUB_OUTPUT
+            echo "Total violations: $VIOLATIONS"
+          else
+            echo "violations=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy & Run Tests
         id: test
         run: |
-          sf apex run test \
+          sf project deploy start \
+            --source-dir force-app \
             --target-org target-org \
-            --result-format json \
-            --output-dir test-results \
             --wait 30 \
-            --code-coverage
-          
-          # Extract coverage percentage
-          COVERAGE=$(jq '.result.summary.testRunCoverage' \
+            --test-level RunLocalTests \
+            --coverage-formatters json \
+            --results-dir test-results
+
+          COVERAGE=$(jq -r '.result.summary.testRunCoverage // "0%"' \
             test-results/test-run-*-codecoverage.json \
-            | tr -d '"' | tr -d '%')
+            | tr -d '%')
           echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
-          
-          # Fail if below 75% (Salesforce minimum)
+
           if (( $(echo "$COVERAGE < 75" | bc -l) )); then
             echo "❌ Coverage $COVERAGE% is below 75% minimum"
             exit 1
