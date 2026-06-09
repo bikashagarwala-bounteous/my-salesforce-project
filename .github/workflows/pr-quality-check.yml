@@ -29,7 +29,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Cache SF CLI & plugins
         uses: actions/cache@v4
@@ -41,7 +41,9 @@ jobs:
           restore-keys: sf-cli-${{ runner.os }}-
 
       - name: Install Salesforce CLI
-        run: npm install -g @salesforce/cli@latest
+        run: |
+          node --version
+          npm install -g @salesforce/cli@latest
 
       - name: Install Code Analyzer v5
         run: sf plugins install @salesforce/plugin-code-analyzer@latest
