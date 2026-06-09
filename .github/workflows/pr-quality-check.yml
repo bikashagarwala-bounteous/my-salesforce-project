@@ -2,37 +2,58 @@ name: PR Quality Check
 
 on:
   pull_request:
-    branches: [development]
+    branches:
+      - development
     types: [opened, edited, synchronize, reopened]
 
+env:
+  MIN_COVERAGE: 75
+  SF_CLI_VERSION: latest
+
 jobs:
-  quality-check:
+  # ─────────────────────────────────────────
+  # JOB 1: Code Analysis + Linting
+  # ─────────────────────────────────────────
+  code-analysis:
+    name: Code Analysis & Linting
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Cache SF CLI & plugins
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/sf
+            ~/.npm
+          key: sf-cli-${{ runner.os }}-${{ hashFiles('**/package.json') }}
+          restore-keys: sf-cli-${{ runner.os }}-
 
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli@latest
 
-      - name: Install Code Analyzer plugin
-        run: sf plugins install @salesforce/sfdx-scanner@latest
+      - name: Install Code Analyzer v5
+        run: sf plugins install @salesforce/plugin-code-analyzer@latest
 
-      - name: Authenticate to Salesforce
+      - name: Install ESLint + LWC plugins
         run: |
-          echo "${{ secrets.SALESFORCE_JWT_KEY }}" > jwt.key
-          sf org login jwt \
-            --client-id ${{ secrets.SALESFORCE_CLIENT_ID }} \
-            --jwt-key-file jwt.key \
-            --username ${{ secrets.SALESFORCE_USERNAME }} \
-            --instance-url https://login.salesforce.com \
-            --alias target-org \
-            --set-default
-          rm jwt.key
+          npm install -g eslint \
+            @lwc/eslint-plugin-lwc \
+            @salesforce/eslint-plugin-aura \
+            @salesforce/eslint-config-lwc \
+            eslint-plugin-import \
+            eslint-plugin-jest
 
       - name: Get changed files
         id: changed-files
@@ -43,54 +64,665 @@ jobs:
             **/*.trigger
             **/*.js
             **/*.html
+            **/*.css
 
-      - name: Run Code Analyzer
-        if: steps.changed-files.outputs.any_changed == 'true'
+      - name: Get changed Apex files only
+        id: apex-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            **/*.cls
+            **/*.trigger
+
+      - name: Get changed LWC files only
+        id: lwc-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            **/lwc/**/*.js
+            **/lwc/**/*.html
+
+      # ── Code Analyzer v5 (Apex) ──
+      - name: Run Code Analyzer v5
+        if: steps.apex-files.outputs.any_changed == 'true'
         id: scan
         continue-on-error: true
         run: |
-          FILES="${{ steps.changed-files.outputs.all_changed_files }}"
-          FORMATTED=$(echo "$FILES" | tr ' ' ',')
-          
-          sf scanner run \
-            --target "$FORMATTED" \
-            --outfile results_raw.json \
-            --format json || true
+          FILES="${{ steps.apex-files.outputs.all_changed_files }}"
 
-          if [ -f results_raw.json ]; then
-            VIOLATIONS=$(jq '[.[] | .violations // []] | add // [] | length' results_raw.json)
-            echo "violations=$VIOLATIONS" >> $GITHUB_OUTPUT
-            echo "Total violations: $VIOLATIONS"
-          else
-            echo "violations=0" >> $GITHUB_OUTPUT
+          sf code-analyzer run \
+            --targets "$FILES" \
+            --output-file scan_raw.json \
+            --output-format json || true
+
+          if [ ! -f scan_raw.json ]; then
+            echo '{"violations":[]}' > scan_raw.json
           fi
 
-      - name: Deploy & Run Tests
-        id: test
+          # Normalise + filter NoTrailingWhitespace
+          jq '
+            (
+              if type == "array" then .
+              elif has("violations") then .violations
+              else []
+              end
+            )
+            | map(select(
+                (.ruleName // .rule // "") |
+                test("NoTrailingWhitespace";"i") | not
+              ))
+            | {
+                violations: .,
+                counts: {
+                  total:    (length),
+                  critical: (map(select(.severity==1)) | length),
+                  high:     (map(select(.severity==2)) | length),
+                  medium:   (map(select(.severity==3)) | length),
+                  low:      (map(select(.severity==4)) | length),
+                  info:     (map(select(.severity==5)) | length)
+                }
+              }
+          ' scan_raw.json > scan_results.json
+
+          TOTAL=$(jq '.counts.total'    scan_results.json)
+          CRIT=$(jq  '.counts.critical' scan_results.json)
+          HIGH=$(jq  '.counts.high'     scan_results.json)
+          echo "total=$TOTAL"     >> $GITHUB_OUTPUT
+          echo "critical=$CRIT"   >> $GITHUB_OUTPUT
+          echo "high=$HIGH"       >> $GITHUB_OUTPUT
+          echo "completed=true"   >> $GITHUB_OUTPUT
+          echo "Analyzer: $TOTAL violations ($CRIT critical, $HIGH high)"
+
+      - name: No Apex files changed
+        if: steps.apex-files.outputs.any_changed != 'true'
         run: |
-          sf project deploy start \
-            --source-dir force-app \
-            --target-org target-org \
-            --wait 30 \
-            --test-level RunLocalTests \
-            --coverage-formatters json \
-            --results-dir test-results
+          echo '{"violations":[],"counts":{"total":0,"critical":0,"high":0,"medium":0,"low":0,"info":0}}' \
+            > scan_results.json
+          echo "total=0"       >> $GITHUB_OUTPUT
+          echo "critical=0"    >> $GITHUB_OUTPUT
+          echo "high=0"        >> $GITHUB_OUTPUT
+          echo "completed=false" >> $GITHUB_OUTPUT
 
-          COVERAGE=$(jq -r '.result.summary.testRunCoverage // "0%"' \
-            test-results/test-run-*-codecoverage.json \
-            | tr -d '%')
-          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+      # ── ESLint (LWC) ──
+      - name: Create ESLint config
+        run: |
+          cat > .eslintrc.json << 'EOF'
+          {
+            "extends": ["@salesforce/eslint-config-lwc/recommended"],
+            "plugins": ["@lwc/eslint-plugin-lwc"],
+            "rules": {
+              "no-unused-vars": "warn",
+              "no-console": "warn",
+              "no-debugger": "error",
+              "@lwc/lwc/no-api-reassignments": "error",
+              "@lwc/lwc/no-document-query": "warn",
+              "@lwc/lwc/no-async-operation": "warn"
+            }
+          }
+          EOF
 
-          if (( $(echo "$COVERAGE < 75" | bc -l) )); then
-            echo "❌ Coverage $COVERAGE% is below 75% minimum"
+      - name: Run ESLint on LWC files
+        if: steps.lwc-files.outputs.any_changed == 'true'
+        id: eslint
+        continue-on-error: true
+        run: |
+          FILES="${{ steps.lwc-files.outputs.all_changed_files }}"
+          eslint $FILES \
+            --format json \
+            --output-file eslint_results.json || true
+
+          if [ ! -f eslint_results.json ]; then
+            echo '[]' > eslint_results.json
+          fi
+
+          ERRORS=$(jq '[.[].messages[] | select(.severity==2)] | length' \
+            eslint_results.json)
+          WARNINGS=$(jq '[.[].messages[] | select(.severity==1)] | length' \
+            eslint_results.json)
+          echo "errors=$ERRORS"     >> $GITHUB_OUTPUT
+          echo "warnings=$WARNINGS" >> $GITHUB_OUTPUT
+          echo "completed=true"     >> $GITHUB_OUTPUT
+          echo "ESLint: $ERRORS errors, $WARNINGS warnings"
+
+      - name: No LWC files changed
+        if: steps.lwc-files.outputs.any_changed != 'true'
+        run: |
+          echo '[]' > eslint_results.json
+          echo "errors=0"      >> $GITHUB_OUTPUT
+          echo "warnings=0"    >> $GITHUB_OUTPUT
+          echo "completed=false" >> $GITHUB_OUTPUT
+
+      # ── Upload raw scan artifacts ──
+      - name: Upload analysis artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-analysis-results
+          path: |
+            scan_raw.json
+            scan_results.json
+            eslint_results.json
+          retention-days: 30
+
+      # ── Full report ──
+      - name: Generate Analysis Report
+        if: always()
+        run: |
+          APEX_TOTAL=$(jq '.counts.total'    scan_results.json 2>/dev/null || echo 0)
+          CRIT=$(jq   '.counts.critical'     scan_results.json 2>/dev/null || echo 0)
+          HIGH=$(jq   '.counts.high'         scan_results.json 2>/dev/null || echo 0)
+          MED=$(jq    '.counts.medium'       scan_results.json 2>/dev/null || echo 0)
+          LOW=$(jq    '.counts.low'          scan_results.json 2>/dev/null || echo 0)
+          INFO=$(jq   '.counts.info'         scan_results.json 2>/dev/null || echo 0)
+          LINT_ERR=$(jq '[.[].messages[]|select(.severity==2)]|length' \
+            eslint_results.json 2>/dev/null || echo 0)
+          LINT_WARN=$(jq '[.[].messages[]|select(.severity==1)]|length' \
+            eslint_results.json 2>/dev/null || echo 0)
+
+          OVERALL_STATUS="✅ PASSED"
+          [ "$CRIT" -gt 0 ]     && OVERALL_STATUS="❌ FAILED"
+          [ "$LINT_ERR" -gt 0 ] && OVERALL_STATUS="❌ FAILED"
+
+          {
+            echo "# PR Quality Check Report"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Overall status** | $OVERALL_STATUS |"
+            echo "| **PR** | #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.title }} |"
+            echo "| **Branch** | \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\` |"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Run** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo ""
+
+            # ── Apex Code Analyzer ──
+            echo "## 🔍 Apex Code Analyzer (v5)"
+            echo ""
+            if [ "${{ steps.apex-files.outputs.any_changed }}" == "true" ]; then
+              echo "| Severity | Count | Gate |"
+              echo "|----------|------:|------|"
+              echo "| 🔴 Critical | $CRIT   | $([ "$CRIT" -eq 0 ]  && echo '✅ Pass' || echo '❌ Fail — blocks merge') |"
+              echo "| 🟠 High     | $HIGH   | $([ "$HIGH" -eq 0 ]  && echo '✅ Pass' || echo '⚠️ Must review') |"
+              echo "| 🟡 Medium   | $MED    | $([ "$MED" -eq 0 ]   && echo '✅ Pass' || echo 'ℹ️ Should fix') |"
+              echo "| 🔵 Low      | $LOW    | $([ "$LOW" -eq 0 ]   && echo '✅ Pass' || echo 'ℹ️ Optional') |"
+              echo "| ⚪ Info     | $INFO   | — |"
+              echo "| **Total**  | **$APEX_TOTAL** | |"
+              echo ""
+
+              if [ "$APEX_TOTAL" -gt 0 ]; then
+                echo "<details>"
+                echo "<summary>📋 View all $APEX_TOTAL violation(s)</summary>"
+                echo ""
+                echo "| Severity | Rule | File | Line | Message | Fix |"
+                echo "|----------|------|------|-----:|---------|-----|"
+
+                jq -r '
+                  .violations
+                  | sort_by(.severity, .fileName, .line)
+                  | .[]
+                  | (if .severity==1 then "🔴 Critical"
+                     elif .severity==2 then "🟠 High"
+                     elif .severity==3 then "🟡 Medium"
+                     elif .severity==4 then "🔵 Low"
+                     else "⚪ Info" end) as $sev
+                  | (.ruleName // .rule // "Unknown") as $rule
+                  | ((.fileName//"") | split("/") | last) as $file
+                  | (.line // "?") as $line
+                  | (.message//"" | gsub("\n";" ") | gsub("\|";"/")
+                      | if length>120 then .[0:117]+"…" else . end) as $msg
+                  | (if ($rule|test("ApexCRUDViolation";"i"))          then "Add CRUD/FLS checks"
+                     elif ($rule|test("AvoidDmlStatementsInLoops";"i")) then "Move DML outside loop"
+                     elif ($rule|test("AvoidSoqlInLoops";"i"))          then "Move SOQL outside loop"
+                     elif ($rule|test("AvoidDebugStatements";"i"))      then "Remove debug statement"
+                     elif ($rule|test("AvoidHardcodingId";"i"))         then "Use Custom Settings/Labels"
+                     elif ($rule|test("CyclomaticComplexity";"i"))      then "Break into smaller methods"
+                     elif ($rule|test("CognitiveComplexity";"i"))       then "Reduce nesting/complexity"
+                     elif ($rule|test("ExcessiveClassLength";"i"))      then "Split into smaller classes"
+                     elif ($rule|test("UnusedLocalVariable";"i"))       then "Remove unused variable"
+                     elif ($rule|test("no-unused-vars";"i"))            then "Remove unused variable"
+                     else "Follow Salesforce best practices" end) as $fix
+                  | "| \($sev) | `\($rule)` | `\($file)` | \($line) | \($msg) | \($fix) |"
+                ' scan_results.json 2>/dev/null \
+                  || echo "| ⚠️ | Parse error | — | — | Check raw artifact | — |"
+
+                echo ""
+                echo "</details>"
+              else
+                echo "✅ No violations found in changed Apex files."
+              fi
+            else
+              echo "⏭️ No Apex files changed — skipped."
+            fi
+            echo ""
+
+            # ── ESLint ──
+            echo "## 🧹 ESLint — LWC / JavaScript"
+            echo ""
+            if [ "${{ steps.lwc-files.outputs.any_changed }}" == "true" ]; then
+              echo "| Type | Count | Gate |"
+              echo "|------|------:|------|"
+              echo "| ❌ Errors   | $LINT_ERR  | $([ "$LINT_ERR" -eq 0 ]  && echo '✅ Pass' || echo '❌ Fail — blocks merge') |"
+              echo "| ⚠️ Warnings | $LINT_WARN | $([ "$LINT_WARN" -eq 0 ] && echo '✅ Pass' || echo 'ℹ️ Review') |"
+              echo ""
+
+              if [ "$LINT_ERR" -gt 0 ] || [ "$LINT_WARN" -gt 0 ]; then
+                echo "<details>"
+                echo "<summary>📋 View ESLint issues</summary>"
+                echo ""
+                echo "| Severity | File | Line | Rule | Message |"
+                echo "|----------|------|-----:|------|---------|"
+
+                jq -r '
+                  .[]
+                  | . as $file
+                  | .filePath as $path
+                  | ($path | split("/") | last) as $fname
+                  | .messages[]
+                  | (if .severity==2 then "❌ Error" else "⚠️ Warning" end) as $sev
+                  | "| \($sev) | `\($fname)` | \(.line) | `\(.ruleId//"—")` | \(.message) |"
+                ' eslint_results.json 2>/dev/null \
+                  || echo "| ⚠️ | Parse error | — | — | Check raw artifact |"
+
+                echo ""
+                echo "</details>"
+              else
+                echo "✅ No ESLint issues found in changed LWC files."
+              fi
+            else
+              echo "⏭️ No LWC/JS files changed — skipped."
+            fi
+            echo ""
+
+            # ── Artifacts ──
+            echo "## 📦 Artifacts"
+            echo ""
+            echo "| File | Description |"
+            echo "|------|-------------|"
+            echo "| \`scan_raw.json\`     | Raw Code Analyzer v5 output |"
+            echo "| \`scan_results.json\` | Parsed + filtered violations |"
+            echo "| \`eslint_results.json\` | ESLint raw output |"
+            echo ""
+            echo "> Download from the **Artifacts** section of this workflow run."
+
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Evaluate gate
+        run: |
+          CRIT=$(jq '.counts.critical' scan_results.json 2>/dev/null || echo 0)
+          LINT_ERR=$(jq '[.[].messages[]|select(.severity==2)]|length' \
+            eslint_results.json 2>/dev/null || echo 0)
+
+          echo "─────────────────────────────"
+          echo "Gate Results:"
+          echo "  Critical Apex violations : $CRIT"
+          echo "  ESLint errors            : $LINT_ERR"
+          echo "─────────────────────────────"
+
+          if [ "$CRIT" -gt 0 ]; then
+            echo "❌ FAILED — $CRIT critical Apex violation(s) must be fixed"
             exit 1
           fi
-          echo "✅ Coverage: $COVERAGE%"
+          if [ "$LINT_ERR" -gt 0 ]; then
+            echo "❌ FAILED — $LINT_ERR ESLint error(s) must be fixed"
+            exit 1
+          fi
+          echo "✅ PASSED — all gates cleared"
 
-      - name: Summary
+  # ─────────────────────────────────────────
+  # JOB 2: Metadata Validation + Tests
+  # ─────────────────────────────────────────
+  validate-and-test:
+    name: Metadata Validation & Tests
+    runs-on: ubuntu-latest
+    needs: code-analysis
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli@latest
+
+      - name: Authenticate to org
         run: |
-          echo "## PR Quality Report" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Code violations | ${{ steps.scan.outputs.violations }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Test coverage | ${{ steps.test.outputs.coverage }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "${{ secrets.SALESFORCE_JWT_KEY }}" > jwt.key
+          sf org login jwt \
+            --client-id    "${{ secrets.SALESFORCE_CLIENT_ID }}" \
+            --jwt-key-file jwt.key \
+            --username     "${{ secrets.SALESFORCE_USERNAME }}" \
+            --instance-url https://login.salesforce.com \
+            --alias        target-org \
+            --set-default
+          rm -f jwt.key
+
+      # ── Parse test classes from PR description ──
+      - name: Extract test classes from PR description
+        id: pr-tests
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Grab comma-separated value after "Test classes:"
+          TEST_LINE=$(echo "$PR_BODY" \
+            | grep -i "^test classes:" \
+            | head -1 \
+            | sed 's/.*Test classes://i' \
+            | tr -d ' ')
+
+          # Clean up: remove backticks, extra spaces
+          TEST_CLASSES=$(echo "$TEST_LINE" \
+            | tr -d '`' \
+            | sed 's/,\s*/,/g' \
+            | sed 's/^,//' \
+            | sed 's/,$//')
+
+          if [ -z "$TEST_CLASSES" ]; then
+            echo "⚠️ No test classes found in PR description"
+            echo "has-tests=false"  >> $GITHUB_OUTPUT
+            echo "test-classes="    >> $GITHUB_OUTPUT
+          else
+            echo "✅ Test classes: $TEST_CLASSES"
+            echo "has-tests=true"            >> $GITHUB_OUTPUT
+            echo "test-classes=$TEST_CLASSES" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Metadata validate (check-only deploy) ──
+      - name: Validate metadata (check-only)
+        id: validate
+        run: |
+          if [ "${{ steps.pr-tests.outputs.has-tests }}" == "true" ]; then
+            TESTS="${{ steps.pr-tests.outputs.test-classes }}"
+            # Convert comma-separated to space-separated for --tests flag
+            TESTS_SPACED=$(echo "$TESTS" | tr ',' ' ')
+
+            sf project deploy start \
+              --source-dir force-app \
+              --target-org target-org \
+              --wait 30 \
+              --dry-run \
+              --test-level RunSpecifiedTests \
+              --tests $TESTS_SPACED \
+              --coverage-formatters json \
+              --results-dir validation-results \
+              --json > deploy_output.json 2>&1 || true
+          else
+            echo "⚠️ No tests specified — running check-only with NoTestRun"
+            sf project deploy start \
+              --source-dir force-app \
+              --target-org target-org \
+              --wait 30 \
+              --dry-run \
+              --test-level NoTestRun \
+              --json > deploy_output.json 2>&1 || true
+          fi
+
+          # Parse deploy result
+          STATUS=$(jq -r '.result.status // .status // "Unknown"' \
+            deploy_output.json 2>/dev/null || echo "Unknown")
+          DEPLOY_ID=$(jq -r '.result.id // "—"' \
+            deploy_output.json 2>/dev/null || echo "—")
+          COMP_TOTAL=$(jq -r '.result.numberComponentsTotal // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          COMP_ERR=$(jq -r '.result.numberComponentErrors // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+
+          echo "status=$STATUS"         >> $GITHUB_OUTPUT
+          echo "deploy-id=$DEPLOY_ID"   >> $GITHUB_OUTPUT
+          echo "comp-total=$COMP_TOTAL" >> $GITHUB_OUTPUT
+          echo "comp-errors=$COMP_ERR"  >> $GITHUB_OUTPUT
+
+          echo "Validation: $STATUS | Components: $COMP_TOTAL | Errors: $COMP_ERR"
+
+      # ── Run tests + coverage ──
+      - name: Run Apex tests & check coverage
+        id: tests
+        if: steps.pr-tests.outputs.has-tests == 'true'
+        run: |
+          TESTS="${{ steps.pr-tests.outputs.test-classes }}"
+          TESTS_SPACED=$(echo "$TESTS" | tr ',' ' ')
+
+          sf apex run test \
+            --target-org target-org \
+            --class-names $TESTS_SPACED \
+            --result-format json \
+            --output-dir test-results \
+            --wait 30 \
+            --code-coverage \
+            --json > test_output.json 2>&1 || true
+
+          # Parse test results
+          PASSING=$(jq '.result.summary.passing // 0'  test_output.json 2>/dev/null || echo 0)
+          FAILING=$(jq '.result.summary.failing // 0'  test_output.json 2>/dev/null || echo 0)
+          TOTAL=$(jq   '.result.summary.testsRan // 0' test_output.json 2>/dev/null || echo 0)
+          COVERAGE=$(jq -r \
+            '.result.summary.testRunCoverage // "0%"' \
+            test_output.json 2>/dev/null \
+            | tr -d '%')
+
+          echo "passing=$PASSING"   >> $GITHUB_OUTPUT
+          echo "failing=$FAILING"   >> $GITHUB_OUTPUT
+          echo "total=$TOTAL"       >> $GITHUB_OUTPUT
+          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "completed=true"     >> $GITHUB_OUTPUT
+
+          echo "Tests: $PASSING passed, $FAILING failed | Coverage: $COVERAGE%"
+
+          # Fail if coverage below minimum
+          if [ -n "$COVERAGE" ] && [ "$COVERAGE" != "null" ]; then
+            if (( $(echo "$COVERAGE < ${{ env.MIN_COVERAGE }}" | bc -l) )); then
+              echo "❌ Coverage $COVERAGE% is below ${{ env.MIN_COVERAGE }}% minimum"
+              exit 1
+            fi
+          fi
+
+      - name: Upload test & validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-validation-results
+          path: |
+            deploy_output.json
+            test_output.json
+            test-results/
+            validation-results/
+          retention-days: 30
+
+      # ── Full validation + test report ──
+      - name: Generate Validation & Test Report
+        if: always()
+        run: |
+          VAL_STATUS="${{ steps.validate.outputs.status }}"
+          COMP_TOTAL="${{ steps.validate.outputs.comp-total }}"
+          COMP_ERR="${{ steps.validate.outputs.comp-errors }}"
+          DEPLOY_ID="${{ steps.validate.outputs.deploy-id }}"
+          HAS_TESTS="${{ steps.pr-tests.outputs.has-tests }}"
+          TEST_CLASSES="${{ steps.pr-tests.outputs.test-classes }}"
+          PASSING="${{ steps.tests.outputs.passing }}"
+          FAILING="${{ steps.tests.outputs.failing }}"
+          TOTAL_TESTS="${{ steps.tests.outputs.total }}"
+          COVERAGE="${{ steps.tests.outputs.coverage }}"
+
+          # Determine icons
+          VAL_ICON="✅"
+          [ "$VAL_STATUS" != "Succeeded" ] && VAL_ICON="❌"
+          [ "$COMP_ERR" -gt 0 ] 2>/dev/null && VAL_ICON="❌"
+
+          COV_ICON="✅"
+          if [ "$HAS_TESTS" == "true" ] && [ -n "$COVERAGE" ]; then
+            (( $(echo "$COVERAGE < ${{ env.MIN_COVERAGE }}" | bc -l) )) \
+              && COV_ICON="❌"
+          fi
+
+          {
+            # ── Metadata Validation ──
+            echo "## $VAL_ICON Metadata Validation (check-only deploy)"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Status**     | $VAL_STATUS |"
+            echo "| **Deploy ID**  | \`$DEPLOY_ID\` |"
+            echo "| **Components** | $COMP_TOTAL total, $COMP_ERR error(s) |"
+            echo "| **Test level** | $([ "$HAS_TESTS" == "true" ] && echo "RunSpecifiedTests" || echo "NoTestRun") |"
+            echo ""
+
+            # Component errors if any
+            if [ "$COMP_ERR" -gt 0 ]; then
+              echo "<details>"
+              echo "<summary>❌ Component errors ($COMP_ERR)</summary>"
+              echo ""
+              echo "| File | Error |"
+              echo "|------|-------|"
+              jq -r '
+                .result.details.componentFailures[]?
+                | "| `\(.fileName // "Unknown")` | \(.problem // "Unknown error") |"
+              ' deploy_output.json 2>/dev/null \
+                || echo "| — | Could not parse errors — check artifact |"
+              echo ""
+              echo "</details>"
+            fi
+            echo ""
+
+            # ── Test Results ──
+            echo "## 🧪 Apex Test Results"
+            echo ""
+            if [ "$HAS_TESTS" == "true" ]; then
+              echo "**Test classes run:** \`$TEST_CLASSES\`"
+              echo ""
+              echo "| Metric | Value | Gate |"
+              echo "|--------|------:|------|"
+              echo "| ✅ Passing      | $PASSING | — |"
+              echo "| ❌ Failing      | $FAILING | $([ "${FAILING:-0}" -eq 0 ] && echo '✅ Pass' || echo '❌ Fail — must fix') |"
+              echo "| 📊 Total run    | $TOTAL_TESTS | — |"
+              echo "| 🎯 Coverage     | ${COVERAGE}% | $COV_ICON $([ "$COV_ICON" == "✅" ] && echo "≥ ${{ env.MIN_COVERAGE }}%" || echo "< ${{ env.MIN_COVERAGE }}% — must fix") |"
+              echo ""
+
+              # Per-test breakdown
+              if [ -f test_output.json ]; then
+                METHODS=$(jq '.result.tests // []' test_output.json 2>/dev/null)
+                if [ "$METHODS" != "null" ] && [ "$METHODS" != "[]" ]; then
+                  echo "<details>"
+                  echo "<summary>📋 Per-test method breakdown</summary>"
+                  echo ""
+                  echo "| Test class | Method | Outcome | Duration |"
+                  echo "|------------|--------|---------|----------:|"
+                  jq -r '
+                    .result.tests[]?
+                    | (if .Outcome=="Pass" then "✅" else "❌" end) as $icon
+                    | "| `\(.ApexClass.Name // "—")` | `\(.MethodName // "—")` | \($icon) \(.Outcome) | \(.RunTime // 0)ms |"
+                  ' test_output.json 2>/dev/null \
+                    || echo "| — | — | Could not parse | — |"
+                  echo ""
+                  echo "</details>"
+                fi
+
+                # Per-class coverage
+                COV_DATA=$(jq '.result.codecoverage // []' test_output.json 2>/dev/null)
+                if [ "$COV_DATA" != "null" ] && [ "$COV_DATA" != "[]" ]; then
+                  echo "<details>"
+                  echo "<summary>📊 Per-class coverage breakdown</summary>"
+                  echo ""
+                  echo "| Class | % Covered | Lines covered | Lines uncovered |"
+                  echo "|-------|----------:|--------------:|----------------:|"
+                  jq -r '
+                    .result.codecoverage[]?
+                    | (.numLinesCovered   as $cov)
+                    | (.numLinesUncovered as $uncov)
+                    | ($cov + $uncov)     as $total
+                    | (if $total > 0 then ($cov * 100 / $total | floor) else 0 end) as $pct
+                    | (if $pct >= 75 then "✅" else "❌" end) as $icon
+                    | "| `\(.name)` | \($icon) \($pct)% | \($cov) | \($uncov) |"
+                  ' test_output.json 2>/dev/null \
+                    || echo "| — | — | — | — |"
+                  echo ""
+                  echo "</details>"
+                fi
+              fi
+
+              # Failing test details
+              if [ "${FAILING:-0}" -gt 0 ]; then
+                echo "<details>"
+                echo "<summary>❌ Failing test details</summary>"
+                echo ""
+                jq -r '
+                  .result.tests[]?
+                  | select(.Outcome == "Fail")
+                  | "### ❌ `\(.ApexClass.Name).\(.MethodName)`\n\n**Error:** \(.Message // "No message")\n\n**Stack trace:**\n```\n\(.StackTrace // "Not available")\n```\n"
+                ' test_output.json 2>/dev/null \
+                  || echo "Could not parse failure details — check artifact"
+                echo ""
+                echo "</details>"
+              fi
+            else
+              echo "⚠️ No test classes specified in the PR description."
+              echo ""
+              echo "To run tests, add this line to your PR description:"
+              echo "\`\`\`"
+              echo "Test classes: MyClassTest, AnotherClassTest"
+              echo "\`\`\`"
+            fi
+            echo ""
+
+            # ── Failure Triage ──
+            echo "## 🔧 Failure Triage Guide"
+            echo ""
+            echo "<details>"
+            echo "<summary>How to investigate failures</summary>"
+            echo ""
+            echo "### Code Analyzer failures"
+            echo "1. Download the \`code-analysis-results\` artifact"
+            echo "2. Open \`scan_results.json\` to see full violation details"
+            echo "3. Fix critical violations — they block the merge"
+            echo "4. High violations should be reviewed and fixed if possible"
+            echo ""
+            echo "### ESLint failures"
+            echo "1. Download the \`code-analysis-results\` artifact"
+            echo "2. Open \`eslint_results.json\`"
+            echo "3. Run locally: \`eslint force-app/main/default/lwc/**/*.js\`"
+            echo ""
+            echo "### Metadata validation failures"
+            echo "1. Check the Component errors section above"
+            echo "2. Download \`test-validation-results\` → open \`deploy_output.json\`"
+            echo "3. Use Deploy ID \`$DEPLOY_ID\` to look up in Salesforce Setup → Deployment Status"
+            echo ""
+            echo "### Test / coverage failures"
+            echo "1. Check the failing test details section above"
+            echo "2. Download \`test-validation-results\` → open \`test_output.json\`"
+            echo "3. Run tests locally: \`sf apex run test --class-names YourTestClass --target-org my-dev-org --result-format human\`"
+            echo "4. If coverage is low, add more test methods to cover uncovered lines"
+            echo ""
+            echo "</details>"
+
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Evaluate test gate
+        if: always()
+        run: |
+          FAILING="${{ steps.tests.outputs.failing }}"
+          COVERAGE="${{ steps.tests.outputs.coverage }}"
+          COMP_ERR="${{ steps.validate.outputs.comp-errors }}"
+
+          echo "─────────────────────────────"
+          echo "Gate Results:"
+          echo "  Component errors : ${COMP_ERR:-0}"
+          echo "  Failing tests    : ${FAILING:-0}"
+          echo "  Coverage         : ${COVERAGE:-N/A}%"
+          echo "─────────────────────────────"
+
+          if [ "${COMP_ERR:-0}" -gt 0 ]; then
+            echo "❌ FAILED — metadata validation errors"
+            exit 1
+          fi
+          if [ "${FAILING:-0}" -gt 0 ]; then
+            echo "❌ FAILED — $FAILING test(s) failing"
+            exit 1
+          fi
+          if [ -n "$COVERAGE" ] && [ "$COVERAGE" != "null" ]; then
+            if (( $(echo "$COVERAGE < ${{ env.MIN_COVERAGE }}" | bc -l) )); then
+              echo "❌ FAILED — coverage ${COVERAGE}% below ${{ env.MIN_COVERAGE }}%"
+              exit 1
+            fi
+          fi
+          echo "✅ PASSED"
