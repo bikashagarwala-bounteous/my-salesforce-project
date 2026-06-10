@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - development
+    branches:
+      - development
     types: [opened, edited, synchronize, reopened]
 
 env:
@@ -24,6 +26,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -42,11 +46,14 @@ jobs:
           restore-keys: sf-cli-${{ runner.os }}-
 
       - name: Install Salesforce CLI
-        run: npm install -g @salesforce/cli@latest
+        run: |
+          node --version
+          npm install -g @salesforce/cli@latest
 
       - name: Install Code Analyzer (PMD)
         run: sf plugins install @salesforce/sfdx-scanner@latest
 
+      - name: Install ESLint + LWC plugins
       - name: Install ESLint + LWC plugins
         run: |
           npm install -g eslint \
