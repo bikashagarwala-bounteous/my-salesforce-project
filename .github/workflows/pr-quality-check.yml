@@ -45,8 +45,8 @@ jobs:
           node --version
           npm install -g @salesforce/cli@latest
 
-      - name: Install Code Analyzer v5
-        run: sf plugins install @salesforce/plugin-code-analyzer@latest
+      - name: Install Code Analyzer
+        run: sf plugins install @salesforce/sfdx-scanner@latest
 
       - name: Install ESLint + LWC plugins
         run: |
@@ -84,31 +84,27 @@ jobs:
             **/lwc/**/*.js
             **/lwc/**/*.html
 
-      # ── Code Analyzer v5 (Apex) ──
-      - name: Run Code Analyzer v5
+      - name: Run Code Analyzer
         if: steps.apex-files.outputs.any_changed == 'true'
         id: scan
         continue-on-error: true
         run: |
           FILES="${{ steps.apex-files.outputs.all_changed_files }}"
+          FORMATTED=$(echo "$FILES" | tr ' ' ',')
 
-          sf code-analyzer run \
-            --targets "$FILES" \
-            --output-file scan_raw.json \
-            --output-format json || true
+          sf scanner run \
+            --target "$FORMATTED" \
+            --format json \
+            --outfile scan_raw.json \
+            --engine pmd || true
 
           if [ ! -f scan_raw.json ]; then
-            echo '{"violations":[]}' > scan_raw.json
+            echo '[]' > scan_raw.json
           fi
 
-          # Normalise + filter NoTrailingWhitespace
+          # Normalise structure — v4 returns an array directly
           jq '
-            (
-              if type == "array" then .
-              elif has("violations") then .violations
-              else []
-              end
-            )
+            (if type == "array" then . else [] end)
             | map(select(
                 (.ruleName // .rule // "") |
                 test("NoTrailingWhitespace";"i") | not
@@ -129,10 +125,10 @@ jobs:
           TOTAL=$(jq '.counts.total'    scan_results.json)
           CRIT=$(jq  '.counts.critical' scan_results.json)
           HIGH=$(jq  '.counts.high'     scan_results.json)
-          echo "total=$TOTAL"     >> $GITHUB_OUTPUT
-          echo "critical=$CRIT"   >> $GITHUB_OUTPUT
-          echo "high=$HIGH"       >> $GITHUB_OUTPUT
-          echo "completed=true"   >> $GITHUB_OUTPUT
+          echo "total=$TOTAL"   >> $GITHUB_OUTPUT
+          echo "critical=$CRIT" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"     >> $GITHUB_OUTPUT
+          echo "completed=true" >> $GITHUB_OUTPUT
           echo "Analyzer: $TOTAL violations ($CRIT critical, $HIGH high)"
 
       - name: No Apex files changed
@@ -484,7 +480,10 @@ jobs:
         if: steps.pr-tests.outputs.has-tests == 'true'
         run: |
           TESTS="${{ steps.pr-tests.outputs.test-classes }}"
+          # Convert comma-separated → space-separated for --tests flag
           TESTS_SPACED=$(echo "$TESTS" | tr ',' ' ')
+
+          mkdir -p test-results
 
           sf apex run test \
             --target-org target-org \
@@ -492,17 +491,53 @@ jobs:
             --result-format json \
             --output-dir test-results \
             --wait 30 \
-            --code-coverage \
-            --json > test_output.json 2>&1 || true
+            --code-coverage 2>&1 | tee test_run_output.txt || true
 
-          # Parse test results
-          PASSING=$(jq '.result.summary.passing // 0'  test_output.json 2>/dev/null || echo 0)
-          FAILING=$(jq '.result.summary.failing // 0'  test_output.json 2>/dev/null || echo 0)
-          TOTAL=$(jq   '.result.summary.testsRan // 0' test_output.json 2>/dev/null || echo 0)
-          COVERAGE=$(jq -r \
-            '.result.summary.testRunCoverage // "0%"' \
-            test_output.json 2>/dev/null \
-            | tr -d '%')
+          # v4 CLI writes the JSON result file with a dynamic name
+          # find it regardless of name
+          RESULT_FILE=$(find test-results -name "*.json" \
+            ! -name "*-codecoverage.json" | head -1)
+
+          echo "Result file found: $RESULT_FILE"
+
+          if [ -z "$RESULT_FILE" ]; then
+            # fallback: try the txt output captured above
+            echo "⚠️ No result JSON found — dumping directory"
+            ls -la test-results/
+            echo "passing=0"    >> $GITHUB_OUTPUT
+            echo "failing=0"    >> $GITHUB_OUTPUT
+            echo "total=0"      >> $GITHUB_OUTPUT
+            echo "coverage=0"   >> $GITHUB_OUTPUT
+            echo "completed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          cp "$RESULT_FILE" test_output.json
+
+          PASSING=$(jq '.summary.passing  // 0' test_output.json 2>/dev/null || echo 0)
+          FAILING=$(jq '.summary.failing  // 0' test_output.json 2>/dev/null || echo 0)
+          TOTAL=$(jq   '.summary.testsRan // 0' test_output.json 2>/dev/null || echo 0)
+
+          # Coverage comes from a separate codecoverage file
+          COV_FILE=$(find test-results -name "*codecoverage*" | head -1)
+          echo "Coverage file: $COV_FILE"
+
+          COVERAGE=0
+          if [ -n "$COV_FILE" ]; then
+            # Try reading aggregate coverage from the file
+            COVERAGE=$(jq -r '
+              if type == "array" then
+                (map(.numLinesCovered) | add // 0) as $cov |
+                (map(.numLinesUncovered) | add // 0) as $uncov |
+                if ($cov + $uncov) > 0 
+                then (($cov * 100) / ($cov + $uncov) | floor)
+                else 0 end
+              elif has("summary") then
+                (.summary.testRunCoverage // "0%") | 
+                gsub("%";"") | tonumber | floor
+              else 0 end
+            ' "$COV_FILE" 2>/dev/null || echo 0)
+          fi
 
           echo "passing=$PASSING"   >> $GITHUB_OUTPUT
           echo "failing=$FAILING"   >> $GITHUB_OUTPUT
@@ -512,13 +547,29 @@ jobs:
 
           echo "Tests: $PASSING passed, $FAILING failed | Coverage: $COVERAGE%"
 
-          # Fail if coverage below minimum
-          if [ -n "$COVERAGE" ] && [ "$COVERAGE" != "null" ]; then
-            if (( $(echo "$COVERAGE < ${{ env.MIN_COVERAGE }}" | bc -l) )); then
-              echo "❌ Coverage $COVERAGE% is below ${{ env.MIN_COVERAGE }}% minimum"
-              exit 1
-            fi
+          if [ "$FAILING" -gt 0 ]; then
+            echo "❌ $FAILING test(s) failing"
+            exit 1
           fi
+
+          if (( $(echo "$COVERAGE < 75" | bc -l) )); then
+            echo "❌ Coverage $COVERAGE% is below 75% minimum"
+            exit 1
+          fi
+
+          echo "✅ Tests passed | Coverage: $COVERAGE%"
+
+      - name: Debug test output structure
+        if: always()
+        run: |
+          echo "=== test-results directory ==="
+          ls -la test-results/ 2>/dev/null || echo "Directory not found"
+          echo ""
+          echo "=== JSON files found ==="
+          find test-results -name "*.json" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            jq 'keys' "$f" 2>/dev/null || echo "Not valid JSON"
+          done
 
       - name: Upload test & validation artifacts
         if: always()
