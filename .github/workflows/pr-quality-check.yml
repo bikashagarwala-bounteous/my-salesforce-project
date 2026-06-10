@@ -435,9 +435,9 @@ jobs:
           if [ "${{ steps.pr-tests.outputs.has-tests }}" == "true" ]; then
             TESTS="${{ steps.pr-tests.outputs.test-classes }}"
             TESTS_SPACED=$(echo "$TESTS" | tr ',' ' ')
-
             echo "Deploying with tests: $TESTS_SPACED"
 
+            # Deploy with multiple coverage formats for better parsing
             sf project deploy start \
               --source-dir force-app \
               --target-org target-org \
@@ -445,6 +445,7 @@ jobs:
               --test-level RunSpecifiedTests \
               --tests $TESTS_SPACED \
               --coverage-formatters json \
+              --coverage-formatters json-summary \
               --results-dir test-results \
               --json > deploy_output.json 2>&1 || true
           else
@@ -457,84 +458,144 @@ jobs:
               --json > deploy_output.json 2>&1 || true
           fi
 
-          echo "=== Deploy output ==="
-          cat deploy_output.json | jq '{status: .result.status, 
-            components: .result.numberComponentsDeployed,
-            errors: .result.numberComponentErrors}' 2>/dev/null || \
-            cat deploy_output.json
+          # Debug full deploy output
+          echo "=== Full deploy output ==="
+          cat deploy_output.json | jq '.' 2>/dev/null | head -80 \
+            || cat deploy_output.json | head -80
 
           # Parse deploy status
           STATUS=$(jq -r '.result.status // "Unknown"' \
             deploy_output.json 2>/dev/null || echo "Unknown")
-          COMP_ERR=$(jq -r '.result.numberComponentErrors // 0' \
+          COMP_ERR=$(jq -r \
+            '.result.numberComponentErrors // 0' \
             deploy_output.json 2>/dev/null || echo 0)
           DEPLOY_ID=$(jq -r '.result.id // "—"' \
             deploy_output.json 2>/dev/null || echo "—")
 
-          echo "status=$STATUS"       >> $GITHUB_OUTPUT
-          echo "deploy-id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+          # Parse test counts from deploy result
+          PASSING=$(jq \
+            '.result.numberTestsCompleted // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          FAILING=$(jq \
+            '.result.numberTestErrors // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+
+          echo "status=$STATUS"        >> $GITHUB_OUTPUT
+          echo "deploy-id=$DEPLOY_ID"  >> $GITHUB_OUTPUT
           echo "comp-errors=$COMP_ERR" >> $GITHUB_OUTPUT
-
-          # Parse test results from deploy output
-          PASSING=$(jq '.result.numberTestsCompleted // 0' \
-            deploy_output.json 2>/dev/null || echo 0)
-          FAILING=$(jq '.result.numberTestErrors // 0' \
-            deploy_output.json 2>/dev/null || echo 0)
-          TOTAL=$(jq '(.result.numberTestsCompleted // 0) + 
-                      (.result.numberTestErrors // 0)' \
-            deploy_output.json 2>/dev/null || echo 0)
-
-          echo "passing=$PASSING" >> $GITHUB_OUTPUT
-          echo "failing=$FAILING" >> $GITHUB_OUTPUT
-          echo "total=$TOTAL"     >> $GITHUB_OUTPUT
+          echo "passing=$PASSING"      >> $GITHUB_OUTPUT
+          echo "failing=$FAILING"      >> $GITHUB_OUTPUT
 
           echo "Deploy: $STATUS | Tests: $PASSING passed, $FAILING failed"
 
-          # Parse coverage from the results dir
-          echo "=== test-results directory ==="
-          ls -la test-results/ 2>/dev/null || echo "empty"
-          find test-results -name "*.json" 2>/dev/null
+          # Debug coverage directory
+          echo "=== test-results structure ==="
+          find test-results -type f | sort
+          echo ""
 
-          COV_FILE=$(find test-results -name "*.json" | head -1)
+          # Try json-summary first (has total pct directly)
+          SUMMARY_FILE=$(find test-results -name "coverage-summary.json" \
+            | head -1)
+          DETAIL_FILE=$(find test-results -name "coverage.json" \
+            | head -1)
+
           COVERAGE=0
 
-          if [ -n "$COV_FILE" ]; then
-            echo "=== Coverage file: $COV_FILE ==="
-            jq 'keys' "$COV_FILE" 2>/dev/null || echo "not valid json"
+          if [ -n "$SUMMARY_FILE" ]; then
+            echo "=== Summary file: $SUMMARY_FILE ==="
+            cat "$SUMMARY_FILE" | jq '.' 2>/dev/null | head -30
 
+            # json-summary format: {"total":{"lines":{"pct":85.7}}}
             COVERAGE=$(jq '
-              if type == "array" then
-                (map(.numLinesCovered)   | add // 0) as $cov |
-                (map(.numLinesUncovered) | add // 0) as $uncov |
-                if ($cov + $uncov) > 0
-                then (($cov * 100) / ($cov + $uncov) | floor)
-                else 0 end
-              else 0 end
-            ' "$COV_FILE" 2>/dev/null || echo 0)
+              .total.lines.pct //
+              .total.statements.pct //
+              0 | floor
+            ' "$SUMMARY_FILE" 2>/dev/null || echo 0)
+            echo "Coverage from summary: $COVERAGE%"
+          fi
 
-            echo "Calculated coverage: $COVERAGE%"
-            cp "$COV_FILE" test_coverage.json
+          # If summary didn't work, try detail file
+          if [ "$COVERAGE" -eq 0 ] && [ -n "$DETAIL_FILE" ]; then
+            echo "=== Detail file: $DETAIL_FILE ==="
+            cat "$DETAIL_FILE" | jq '.' 2>/dev/null | head -30
+
+            # Try object format: {"/path/to/File":{"s":{...},"f":{...}}}
+            COVERAGE=$(jq '
+              if type == "object" then
+                to_entries
+                | map(.value)
+                | map(
+                    (.s // {} | to_entries 
+                      | {
+                          hit:   (map(select(.value > 0)) | length),
+                          total: (length)
+                        }
+                    )
+                  )
+                | {
+                    hit:   (map(.hit)   | add // 0),
+                    total: (map(.total) | add // 0)
+                  }
+                | if .total > 0
+                  then ((.hit * 100) / .total | floor)
+                  else 0 end
+              else 0 end
+            ' "$DETAIL_FILE" 2>/dev/null || echo 0)
+            echo "Coverage from detail: $COVERAGE%"
+          fi
+
+          # Last resort — pull coverage from deploy output directly
+          if [ "$COVERAGE" -eq 0 ]; then
+            echo "Trying coverage from deploy output..."
+            COVERAGE=$(jq '
+              .result.runTestResult.codeCoverage // []
+              | if length > 0 then
+                  (map(.numLocations)        | add // 0) as $total |
+                  (map(.numLocationsNotCovered) | add // 0) as $uncov |
+                  if $total > 0
+                  then ((($total - $uncov) * 100) / $total | floor)
+                  else 0 end
+                else 0 end
+            ' deploy_output.json 2>/dev/null || echo 0)
+            echo "Coverage from deploy output: $COVERAGE%"
           fi
 
           echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
           echo "completed=true"     >> $GITHUB_OUTPUT
 
-          # Gates
+          echo "Final: Deploy=$STATUS | Coverage=$COVERAGE%"
+
+          # Gates — check component errors first
           if [ "$COMP_ERR" -gt 0 ]; then
             echo "❌ FAILED — $COMP_ERR component error(s)"
             exit 1
           fi
+
+          # Failing tests
           if [ "$FAILING" -gt 0 ]; then
             echo "❌ FAILED — $FAILING test(s) failing"
             exit 1
           fi
+
+          # Coverage gate — only if tests were specified
           if [ "${{ steps.pr-tests.outputs.has-tests }}" == "true" ]; then
             if (( $(echo "$COVERAGE < 75" | bc -l) )); then
               echo "❌ FAILED — coverage ${COVERAGE}% below 75%"
               exit 1
             fi
           fi
+
           echo "✅ PASSED — Deploy: $STATUS | Coverage: $COVERAGE%"
+
+      - name: Upload deploy artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-validation-results
+          path: |
+            deploy_output.json
+            test-results/
+          retention-days: 30
 
       - name: Debug test output structure
         if: always()
