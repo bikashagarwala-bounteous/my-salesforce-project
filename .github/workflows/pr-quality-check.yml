@@ -427,137 +427,114 @@ jobs:
             echo "test-classes=$TEST_CLASSES" >> $GITHUB_OUTPUT
           fi
 
-      # ── Metadata validate (check-only deploy) ──
-      - name: Validate metadata (check-only)
-        id: validate
+      - name: Deploy & Run Tests
+        id: tests
         run: |
+          mkdir -p test-results
+
           if [ "${{ steps.pr-tests.outputs.has-tests }}" == "true" ]; then
             TESTS="${{ steps.pr-tests.outputs.test-classes }}"
-            # Convert comma-separated to space-separated for --tests flag
             TESTS_SPACED=$(echo "$TESTS" | tr ',' ' ')
+
+            echo "Deploying with tests: $TESTS_SPACED"
 
             sf project deploy start \
               --source-dir force-app \
               --target-org target-org \
               --wait 30 \
-              --dry-run \
               --test-level RunSpecifiedTests \
               --tests $TESTS_SPACED \
               --coverage-formatters json \
-              --results-dir validation-results \
+              --results-dir test-results \
               --json > deploy_output.json 2>&1 || true
           else
-            echo "⚠️ No tests specified — running check-only with NoTestRun"
+            echo "⚠️ No tests specified — deploying without tests"
             sf project deploy start \
               --source-dir force-app \
               --target-org target-org \
               --wait 30 \
-              --dry-run \
               --test-level NoTestRun \
               --json > deploy_output.json 2>&1 || true
           fi
 
-          # Parse deploy result
-          STATUS=$(jq -r '.result.status // .status // "Unknown"' \
+          echo "=== Deploy output ==="
+          cat deploy_output.json | jq '{status: .result.status, 
+            components: .result.numberComponentsDeployed,
+            errors: .result.numberComponentErrors}' 2>/dev/null || \
+            cat deploy_output.json
+
+          # Parse deploy status
+          STATUS=$(jq -r '.result.status // "Unknown"' \
             deploy_output.json 2>/dev/null || echo "Unknown")
-          DEPLOY_ID=$(jq -r '.result.id // "—"' \
-            deploy_output.json 2>/dev/null || echo "—")
-          COMP_TOTAL=$(jq -r '.result.numberComponentsTotal // 0' \
-            deploy_output.json 2>/dev/null || echo 0)
           COMP_ERR=$(jq -r '.result.numberComponentErrors // 0' \
             deploy_output.json 2>/dev/null || echo 0)
+          DEPLOY_ID=$(jq -r '.result.id // "—"' \
+            deploy_output.json 2>/dev/null || echo "—")
 
-          echo "status=$STATUS"         >> $GITHUB_OUTPUT
-          echo "deploy-id=$DEPLOY_ID"   >> $GITHUB_OUTPUT
-          echo "comp-total=$COMP_TOTAL" >> $GITHUB_OUTPUT
-          echo "comp-errors=$COMP_ERR"  >> $GITHUB_OUTPUT
+          echo "status=$STATUS"       >> $GITHUB_OUTPUT
+          echo "deploy-id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+          echo "comp-errors=$COMP_ERR" >> $GITHUB_OUTPUT
 
-          echo "Validation: $STATUS | Components: $COMP_TOTAL | Errors: $COMP_ERR"
+          # Parse test results from deploy output
+          PASSING=$(jq '.result.numberTestsCompleted // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          FAILING=$(jq '.result.numberTestErrors // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          TOTAL=$(jq '(.result.numberTestsCompleted // 0) + 
+                      (.result.numberTestErrors // 0)' \
+            deploy_output.json 2>/dev/null || echo 0)
 
-      # ── Run tests + coverage ──
-      - name: Run Apex tests & check coverage
-        id: tests
-        if: steps.pr-tests.outputs.has-tests == 'true'
-        run: |
-          TESTS="${{ steps.pr-tests.outputs.test-classes }}"
-          # Convert comma-separated → space-separated for --tests flag
-          TESTS_SPACED=$(echo "$TESTS" | tr ',' ' ')
+          echo "passing=$PASSING" >> $GITHUB_OUTPUT
+          echo "failing=$FAILING" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL"     >> $GITHUB_OUTPUT
 
-          mkdir -p test-results
+          echo "Deploy: $STATUS | Tests: $PASSING passed, $FAILING failed"
 
-          sf apex run test \
-            --target-org target-org \
-            --class-names $TESTS_SPACED \
-            --result-format json \
-            --output-dir test-results \
-            --wait 30 \
-            --code-coverage 2>&1 | tee test_run_output.txt || true
+          # Parse coverage from the results dir
+          echo "=== test-results directory ==="
+          ls -la test-results/ 2>/dev/null || echo "empty"
+          find test-results -name "*.json" 2>/dev/null
 
-          # v4 CLI writes the JSON result file with a dynamic name
-          # find it regardless of name
-          RESULT_FILE=$(find test-results -name "*.json" \
-            ! -name "*-codecoverage.json" | head -1)
-
-          echo "Result file found: $RESULT_FILE"
-
-          if [ -z "$RESULT_FILE" ]; then
-            # fallback: try the txt output captured above
-            echo "⚠️ No result JSON found — dumping directory"
-            ls -la test-results/
-            echo "passing=0"    >> $GITHUB_OUTPUT
-            echo "failing=0"    >> $GITHUB_OUTPUT
-            echo "total=0"      >> $GITHUB_OUTPUT
-            echo "coverage=0"   >> $GITHUB_OUTPUT
-            echo "completed=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          cp "$RESULT_FILE" test_output.json
-
-          PASSING=$(jq '.summary.passing  // 0' test_output.json 2>/dev/null || echo 0)
-          FAILING=$(jq '.summary.failing  // 0' test_output.json 2>/dev/null || echo 0)
-          TOTAL=$(jq   '.summary.testsRan // 0' test_output.json 2>/dev/null || echo 0)
-
-          # Coverage comes from a separate codecoverage file
-          COV_FILE=$(find test-results -name "*codecoverage*" | head -1)
-          echo "Coverage file: $COV_FILE"
-
+          COV_FILE=$(find test-results -name "*.json" | head -1)
           COVERAGE=0
+
           if [ -n "$COV_FILE" ]; then
-            # Try reading aggregate coverage from the file
-            COVERAGE=$(jq -r '
+            echo "=== Coverage file: $COV_FILE ==="
+            jq 'keys' "$COV_FILE" 2>/dev/null || echo "not valid json"
+
+            COVERAGE=$(jq '
               if type == "array" then
-                (map(.numLinesCovered) | add // 0) as $cov |
+                (map(.numLinesCovered)   | add // 0) as $cov |
                 (map(.numLinesUncovered) | add // 0) as $uncov |
-                if ($cov + $uncov) > 0 
+                if ($cov + $uncov) > 0
                 then (($cov * 100) / ($cov + $uncov) | floor)
                 else 0 end
-              elif has("summary") then
-                (.summary.testRunCoverage // "0%") | 
-                gsub("%";"") | tonumber | floor
               else 0 end
             ' "$COV_FILE" 2>/dev/null || echo 0)
+
+            echo "Calculated coverage: $COVERAGE%"
+            cp "$COV_FILE" test_coverage.json
           fi
 
-          echo "passing=$PASSING"   >> $GITHUB_OUTPUT
-          echo "failing=$FAILING"   >> $GITHUB_OUTPUT
-          echo "total=$TOTAL"       >> $GITHUB_OUTPUT
           echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
           echo "completed=true"     >> $GITHUB_OUTPUT
 
-          echo "Tests: $PASSING passed, $FAILING failed | Coverage: $COVERAGE%"
-
+          # Gates
+          if [ "$COMP_ERR" -gt 0 ]; then
+            echo "❌ FAILED — $COMP_ERR component error(s)"
+            exit 1
+          fi
           if [ "$FAILING" -gt 0 ]; then
-            echo "❌ $FAILING test(s) failing"
+            echo "❌ FAILED — $FAILING test(s) failing"
             exit 1
           fi
-
-          if (( $(echo "$COVERAGE < 75" | bc -l) )); then
-            echo "❌ Coverage $COVERAGE% is below 75% minimum"
-            exit 1
+          if [ "${{ steps.pr-tests.outputs.has-tests }}" == "true" ]; then
+            if (( $(echo "$COVERAGE < 75" | bc -l) )); then
+              echo "❌ FAILED — coverage ${COVERAGE}% below 75%"
+              exit 1
+            fi
           fi
-
-          echo "✅ Tests passed | Coverage: $COVERAGE%"
+          echo "✅ PASSED — Deploy: $STATUS | Coverage: $COVERAGE%"
 
       - name: Debug test output structure
         if: always()
