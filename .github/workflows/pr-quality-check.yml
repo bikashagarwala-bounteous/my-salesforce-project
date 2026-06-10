@@ -449,22 +449,38 @@ jobs:
           fi
 
           # ── Parse deploy result ──
-          STATUS=$(   jq -r '.result.status               // "Unknown"' deploy_output.json 2>/dev/null || echo "Unknown")
-          DEPLOY_ID=$(jq -r '.result.id                   // "—"'       deploy_output.json 2>/dev/null || echo "—")
-          COMP_TOT=$( jq -r '.result.numberComponentsDeployed // 0'     deploy_output.json 2>/dev/null || echo 0)
-          COMP_ERR=$( jq -r '.result.numberComponentErrors    // 0'     deploy_output.json 2>/dev/null || echo 0)
-          PASSING=$(  jq    '.result.numberTestsCompleted      // 0'    deploy_output.json 2>/dev/null || echo 0)
-          FAILING=$(  jq    '.result.numberTestErrors           // 0'   deploy_output.json 2>/dev/null || echo 0)
+          DEPLOY_ID=$(jq -r '.result.id                        // "—"' deploy_output.json 2>/dev/null || echo "—")
+          COMP_TOT=$( jq -r '.result.numberComponentsDeployed  // 0'   deploy_output.json 2>/dev/null || echo 0)
+          COMP_ERR=$( jq -r '.result.numberComponentErrors     // 0'   deploy_output.json 2>/dev/null || echo 0)
 
-          echo "status=$STATUS"         >> $GITHUB_OUTPUT
-          echo "deploy-id=$DEPLOY_ID"   >> $GITHUB_OUTPUT
-          echo "comp-total=$COMP_TOT"   >> $GITHUB_OUTPUT
-          echo "comp-errors=$COMP_ERR"  >> $GITHUB_OUTPUT
-          echo "passing=$PASSING"       >> $GITHUB_OUTPUT
-          echo "failing=$FAILING"       >> $GITHUB_OUTPUT
+          PASSING=$(jq '
+            (.result.runTestResult.successes // []) | length
+          ' deploy_output.json 2>/dev/null || echo 0)
+
+          FAILING=$(jq '
+            (.result.runTestResult.failures // []) | length
+          ' deploy_output.json 2>/dev/null || echo 0)
+
+          TOTAL=$(( PASSING + FAILING ))
+
+          # Deploy "status" from Salesforce is unreliable with RunSpecifiedTests
+          # because it checks org-wide coverage, not just our classes.
+          # We define success by: 0 component errors + 0 test failures.
+          if [ "$COMP_ERR" -eq 0 ] && [ "$FAILING" -eq 0 ]; then
+            EFFECTIVE_STATUS="Succeeded"
+          else
+            EFFECTIVE_STATUS="Failed"
+          fi
+
+          echo "deploy-id=$DEPLOY_ID"          >> $GITHUB_OUTPUT
+          echo "comp-total=$COMP_TOT"          >> $GITHUB_OUTPUT
+          echo "comp-errors=$COMP_ERR"         >> $GITHUB_OUTPUT
+          echo "passing=$PASSING"              >> $GITHUB_OUTPUT
+          echo "failing=$FAILING"              >> $GITHUB_OUTPUT
+          echo "total=$TOTAL"                  >> $GITHUB_OUTPUT
+          echo "status=$EFFECTIVE_STATUS"      >> $GITHUB_OUTPUT
 
           # ── Parse coverage ──
-          # Try json-summary first — cleanest format
           SUMMARY=$(find test-results -name "coverage-summary.json" | head -1)
           DETAIL=$(  find test-results -name "coverage.json"         | head -1)
           COVERAGE=0
@@ -475,25 +491,23 @@ jobs:
             ' "$SUMMARY" 2>/dev/null || echo 0)
           fi
 
-          # Fallback: detail file (istanbul/nyc object format)
           if [ "$COVERAGE" -eq 0 ] && [ -n "$DETAIL" ]; then
             COVERAGE=$(jq '
               if type == "object" then
                 [ to_entries[].value.s // {} | to_entries[] ] as $stmts |
-                ($stmts | map(select(.value  > 0)) | length) as $hit   |
+                ($stmts | map(select(.value > 0)) | length) as $hit   |
                 ($stmts | length) as $total |
                 if $total > 0 then ($hit * 100 / $total | floor) else 0 end
               else 0 end
             ' "$DETAIL" 2>/dev/null || echo 0)
           fi
 
-          # Fallback: pull directly from deploy JSON
           if [ "$COVERAGE" -eq 0 ]; then
             COVERAGE=$(jq '
               .result.runTestResult.codeCoverage // [] |
               if length > 0 then
-                (map(.numLocations)            | add // 0) as $tot  |
-                (map(.numLocationsNotCovered)  | add // 0) as $miss |
+                (map(.numLocations)           | add // 0) as $tot  |
+                (map(.numLocationsNotCovered) | add // 0) as $miss |
                 if $tot > 0
                 then (($tot - $miss) * 100 / $tot | floor)
                 else 0 end
@@ -502,7 +516,11 @@ jobs:
           fi
 
           echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
-          echo "Deploy: $STATUS | Components: $COMP_TOT ($COMP_ERR errors) | Tests: $PASSING passed, $FAILING failed | Coverage: $COVERAGE%"
+
+          echo "Effective status : $EFFECTIVE_STATUS"
+          echo "Components       : $COMP_TOT deployed, $COMP_ERR errors"
+          echo "Tests            : $PASSING passed, $FAILING failed ($TOTAL total)"
+          echo "Coverage         : $COVERAGE%"
 
       # ── Upload everything for triage ──
       - name: Upload deploy & test artifacts
@@ -527,12 +545,12 @@ jobs:
           TEST_CLASSES="${{ steps.pr-tests.outputs.test-classes }}"
           PASSING="${{ steps.deploy.outputs.passing }}"
           FAILING="${{ steps.deploy.outputs.failing }}"
+          TOTAL="${{ steps.deploy.outputs.total }}"
           COVERAGE="${{ steps.deploy.outputs.coverage }}"
 
-          # Overall status
           JOB_STATUS="✅ Passed"
-          [ "$COMP_ERR" -gt 0 ]  && JOB_STATUS="❌ Failed"
-          [ "$FAILING"  -gt 0 ]  && JOB_STATUS="❌ Failed"
+          [ "$COMP_ERR" -gt 0 ] && JOB_STATUS="❌ Failed"
+          [ "$FAILING"  -gt 0 ] && JOB_STATUS="❌ Failed"
           if [ "$HAS_TESTS" == "true" ] && \
              (( $(echo "${COVERAGE:-0} < ${{ env.MIN_COVERAGE }}" | bc -l) )); then
             JOB_STATUS="❌ Failed"
@@ -543,12 +561,18 @@ jobs:
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| **Status**      | $JOB_STATUS |"
-            echo "| **Deploy ID**   | \`$DEPLOY_ID\` |"
-            echo "| **Deploy status** | $STATUS |"
-            echo "| **Components**  | $COMP_TOT deployed, $COMP_ERR error(s) |"
-            echo "| **Test level**  | $([ "$HAS_TESTS" == "true" ] \
+            echo "| **Status**     | $JOB_STATUS |"
+            echo "| **Deploy ID**  | \`$DEPLOY_ID\` |"
+            echo "| **Components** | $COMP_TOT deployed, $COMP_ERR error(s) |"
+            echo "| **Test level** | $([ "$HAS_TESTS" == "true" ] \
                    && echo "RunSpecifiedTests" || echo "NoTestRun") |"
+            echo ""
+
+            # ── Note about Salesforce deploy status ──
+            echo "> ℹ️ Salesforce may report the deploy as \`Failed\` when using"
+            echo "> \`RunSpecifiedTests\` because it checks org-wide coverage, not"
+            echo "> just the classes in this PR. The gate above uses component"
+            echo "> errors + test failures + PR-specific coverage instead."
             echo ""
 
             # ── Component errors ──
@@ -561,7 +585,7 @@ jobs:
                 .result.details.componentFailures[]?
                 | "| `\(.fileName // "Unknown")` | \(.problem // "Unknown error") |"
               ' deploy_output.json 2>/dev/null \
-                || echo "| — | Could not parse — download artifact for details |"
+                || echo "| — | Download artifact for details |"
               echo ""
             fi
 
@@ -574,25 +598,51 @@ jobs:
               (( $(echo "${COVERAGE:-0} < ${{ env.MIN_COVERAGE }}" | bc -l) )) \
                 && COV_ICON="❌"
 
-              echo "**Classes run:** \`$TEST_CLASSES\`"
+              echo "**Classes run:** \`$(echo $TEST_CLASSES | tr ',' ', ')\`"
               echo ""
               echo "| Metric | Value | Gate |"
               echo "|--------|------:|------|"
-              echo "| ✅ Passing   | $PASSING | — |"
-              echo "| ❌ Failing   | $FAILING | $([ "${FAILING:-0}" -eq 0 ] \
+              echo "| ✅ Passing  | $PASSING | — |"
+              echo "| ❌ Failing  | $FAILING | $([ "${FAILING:-0}" -eq 0 ] \
                      && echo '✅ Pass' || echo '❌ Fail — must fix') |"
-              echo "| 🎯 Coverage  | ${COVERAGE}% | $COV_ICON $([ "$COV_ICON" == "✅" ] \
+              echo "| 📊 Total    | $TOTAL | — |"
+              echo "| 🎯 Coverage | ${COVERAGE}% | $COV_ICON $([ "$COV_ICON" == "✅" ] \
                      && echo "≥ ${{ env.MIN_COVERAGE }}%" \
                      || echo "< ${{ env.MIN_COVERAGE }}% — **must fix**") |"
               echo ""
 
-              # Per-class coverage from deploy output
+              # Per-method breakdown from successes + failures arrays
+              echo "<details>"
+              echo "<summary>📋 Per-test method results ($TOTAL methods) — click to expand</summary>"
+              echo ""
+              echo "| Class | Method | Result | Time |"
+              echo "|-------|--------|--------|-----:|"
+
+              # Passed tests
+              jq -r '
+                .result.runTestResult.successes[]?
+                | "| `\(.name // "—")` | `\(.methodName // "—")` | ✅ Pass | \(.time // 0)ms |"
+              ' deploy_output.json 2>/dev/null
+
+              # Failed tests
+              jq -r '
+                .result.runTestResult.failures[]?
+                | "| `\(.name // "—")` | `\(.methodName // "—")` | ❌ Fail | \(.time // 0)ms |"
+              ' deploy_output.json 2>/dev/null
+
+              echo ""
+              echo "</details>"
+              echo ""
+
+              # Per-class coverage breakdown
               COV_ROWS=$(jq -r '
                 .result.runTestResult.codeCoverage[]?
-                | (.numLocations            // 0) as $tot  |
-                  (.numLocationsNotCovered  // 0) as $miss |
-                  ($tot - $miss)                  as $cov  |
-                  (if $tot > 0 then ($cov * 100 / $tot | floor) else 0 end) as $pct |
+                | (.numLocations           // 0) as $tot  |
+                  (.numLocationsNotCovered // 0) as $miss |
+                  ($tot - $miss)                 as $cov  |
+                  (if $tot > 0
+                   then ($cov * 100 / $tot | floor)
+                   else 0 end)                   as $pct  |
                   (if $pct >= 75 then "✅" else "❌" end) as $icon |
                 "| `\(.name)` | \($icon) \($pct)% | \($cov) / \($tot) |"
               ' deploy_output.json 2>/dev/null)
@@ -609,26 +659,6 @@ jobs:
                 echo ""
               fi
 
-              # Per-method results
-              METHOD_ROWS=$(jq -r '
-                .result.runTestResult.successes[]?,
-                .result.runTestResult.failures[]?
-                | (if .methodName then "✅" else "❌" end) as $icon
-                | "| `\(.name // "—")` | `\(.methodName // "—")` | \($icon) |"
-              ' deploy_output.json 2>/dev/null)
-
-              if [ -n "$METHOD_ROWS" ]; then
-                echo "<details>"
-                echo "<summary>📋 Per-method results — click to expand</summary>"
-                echo ""
-                echo "| Class | Method | Result |"
-                echo "|-------|--------|--------|"
-                echo "$METHOD_ROWS"
-                echo ""
-                echo "</details>"
-                echo ""
-              fi
-
               # Failing test details
               if [ "${FAILING:-0}" -gt 0 ]; then
                 echo "### ❌ Failing test details"
@@ -640,6 +670,7 @@ jobs:
                   || echo "Could not parse — download artifact for details"
                 echo ""
               fi
+
             else
               echo "> ⚠️ No test classes were specified in the PR description."
               echo ">"
@@ -656,22 +687,23 @@ jobs:
             echo "<summary>Expand triage guide</summary>"
             echo ""
             echo "### Component errors"
-            echo "- Check the table above for the exact file and error message"
-            echo "- Use Deploy ID \`$DEPLOY_ID\` in **Salesforce Setup → Deployment Status** for full details"
+            echo "- Check the table above for the exact file and error"
+            echo "- Use Deploy ID \`$DEPLOY_ID\` in **Salesforce Setup → Deployment Status**"
             echo "- Download the \`deploy-test-results\` artifact → open \`deploy_output.json\`"
             echo ""
             echo "### Test failures"
-            echo "- Read the failing test details above for the exact error and stack trace"
+            echo "- Read the failing test details above for error + stack trace"
             echo "- Run locally: \`sf apex run test --class-names YourTestClass --target-org my-dev-org --result-format human\`"
             echo ""
             echo "### Coverage below ${{ env.MIN_COVERAGE }}%"
-            echo "- Check the per-class coverage table above to see which classes need more tests"
-            echo "- Add test methods that exercise the uncovered lines"
-            echo "- Run locally to check: \`sf apex run test --class-names YourTestClass --target-org my-dev-org --code-coverage --result-format human\`"
+            echo "- Check per-class coverage above to see which classes need more tests"
+            echo "- Run locally with coverage: \`sf apex run test --class-names YourTestClass --target-org my-dev-org --code-coverage --result-format human\`"
             echo ""
-            echo "### Deploy status shows Failed but 0 component errors"
-            echo "- This usually means the org-level coverage threshold (75%) was not met"
-            echo "- Check the coverage value above — if it is below 75%, add more test coverage"
+            echo "### Why does Salesforce show deploy status as Failed?"
+            echo "- \`RunSpecifiedTests\` only runs your specified tests but Salesforce"
+            echo "  checks coverage across ALL classes in the org, not just yours."
+            echo "- This workflow gates on component errors + test failures + PR coverage"
+            echo "  instead of the Salesforce deploy status field."
             echo ""
             echo "</details>"
 
