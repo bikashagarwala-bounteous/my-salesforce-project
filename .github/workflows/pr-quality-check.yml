@@ -574,13 +574,7 @@ jobs:
             echo "| **Test level** | $([ "$HAS_TESTS" == "true" ] \
                    && echo "RunSpecifiedTests" || echo "NoTestRun") |"
             echo ""
-
-            echo "> ℹ️ Salesforce may report the deploy as \`Failed\` when using"
-            echo "> \`RunSpecifiedTests\` because it checks org-wide coverage across"
-            echo "> ALL classes, not just the ones in this PR. This workflow gates"
-            echo "> on component errors + test failures + PR-specific coverage instead."
-            echo ""
-
+            
             # ── Component errors ──
             if [ "${COMP_ERR:-0}" -gt 0 ]; then
               echo "## ❌ Component Errors"
