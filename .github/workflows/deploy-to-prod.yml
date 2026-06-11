@@ -3,15 +3,17 @@ name: Deploy to Production
 on:
   push:
     tags:
-      - 'v*.*.*'   # triggers on tags like v1.0.0, v2.3.1
+      - 'v*.*.*'
 
 jobs:
   deploy-prod:
+    name: Deploy to Production org
     runs-on: ubuntu-latest
-    environment: production    # requires manual approval in GitHub
+    environment: production      # requires manual approval in GitHub
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -22,27 +24,60 @@ jobs:
         run: |
           echo "${{ secrets.SALESFORCE_PROD_JWT_KEY }}" > jwt.key
           sf org login jwt \
-            --client-id ${{ secrets.SALESFORCE_PROD_CLIENT_ID }} \
+            --client-id    "${{ secrets.SALESFORCE_PROD_CLIENT_ID }}" \
             --jwt-key-file jwt.key \
-            --username ${{ secrets.SALESFORCE_PROD_USERNAME }} \
+            --username     "${{ secrets.SALESFORCE_PROD_USERNAME }}" \
             --instance-url https://login.salesforce.com \
-            --alias prod-org \
+            --alias        prod-org \
             --set-default
-          rm jwt.key
+          rm -f jwt.key
 
       - name: Deploy to Production
         run: |
           sf project deploy start \
             --source-dir force-app \
             --target-org prod-org \
-            --wait 60 \
-            --test-level RunLocalTests
+            --wait       60 \
+            --test-level RunLocalTests \
+            --json > deploy_output.json 2>&1 || true
 
-      - name: Create GitHub Release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          STATUS=$(jq -r '.result.status // "Unknown"' \
+            deploy_output.json 2>/dev/null || echo "Unknown")
+          COMP_TOT=$(jq -r '.result.numberComponentsDeployed // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          COMP_ERR=$(jq -r '.result.numberComponentErrors // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          DEPLOY_ID=$(jq -r '.result.id // "—"' \
+            deploy_output.json 2>/dev/null || echo "—")
+          PASSING=$(jq '.result.details.runTestResult.successes // [] | length' \
+            deploy_output.json 2>/dev/null || echo 0)
+          FAILING=$(jq '.result.details.runTestResult.failures  // [] | length' \
+            deploy_output.json 2>/dev/null || echo 0)
+
+          {
+            echo "# 🟢 Production Deployment"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Status**     | $STATUS |"
+            echo "| **Deploy ID**  | \`$DEPLOY_ID\` |"
+            echo "| **Components** | $COMP_TOT deployed, $COMP_ERR error(s) |"
+            echo "| **Tests**      | $PASSING passed, $FAILING failed |"
+            echo "| **Release tag**| \`${{ github.ref_name }}\` |"
+            echo "| **Commit**     | \`$(echo ${{ github.sha }} | cut -c1-8)\` |"
+            echo "| **Deployed by**| ${{ github.actor }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
+          if [ "$COMP_ERR" -gt 0 ] || [ "$FAILING" -gt 0 ]; then
+            echo "❌ Production deploy failed"
+            exit 1
+          fi
+          echo "✅ Production deploy succeeded — ${{ github.ref_name }}"
+
+      - name: Upload prod deploy artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          release_name: Release ${{ github.ref_name }}
-          draft: false
+          name: prod-deploy-${{ github.run_id }}
+          path: deploy_output.json
+          retention-days: 30

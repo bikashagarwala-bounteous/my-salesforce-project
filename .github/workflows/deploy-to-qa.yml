@@ -6,38 +6,71 @@ on:
 
 jobs:
   deploy-qa:
+    name: Deploy to QA org
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Install Salesforce CLI
         run: npm install -g @salesforce/cli@latest
 
-      - name: Authenticate to Salesforce (QA org)
+      - name: Authenticate to QA org
         run: |
           echo "${{ secrets.SALESFORCE_JWT_KEY }}" > jwt.key
           sf org login jwt \
-            --client-id ${{ secrets.SALESFORCE_CLIENT_ID }} \
+            --client-id    "${{ secrets.SALESFORCE_CLIENT_ID }}" \
             --jwt-key-file jwt.key \
-            --username ${{ secrets.SALESFORCE_USERNAME }} \
+            --username     "${{ secrets.SALESFORCE_USERNAME }}" \
             --instance-url https://login.salesforce.com \
-            --alias qa-org \
+            --alias        qa-org \
             --set-default
-          rm jwt.key
+          rm -f jwt.key
 
-      - name: Deploy to QA org
+      - name: Deploy to QA
         run: |
           sf project deploy start \
             --source-dir force-app \
             --target-org qa-org \
-            --wait 30 \
-            --test-level RunLocalTests
+            --wait       30 \
+            --test-level RunLocalTests \
+            --json > deploy_output.json 2>&1 || true
 
-      - name: Notify on success
-        run: |
-          echo "## ✅ Deployed to QA" >> $GITHUB_STEP_SUMMARY
-          echo "Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          STATUS=$(jq -r '.result.status // "Unknown"' \
+            deploy_output.json 2>/dev/null || echo "Unknown")
+          COMP_TOT=$(jq -r '.result.numberComponentsDeployed // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          COMP_ERR=$(jq -r '.result.numberComponentErrors // 0' \
+            deploy_output.json 2>/dev/null || echo 0)
+          DEPLOY_ID=$(jq -r '.result.id // "—"' \
+            deploy_output.json 2>/dev/null || echo "—")
+
+          {
+            echo "# 🟡 QA Deployment"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Status**     | $STATUS |"
+            echo "| **Deploy ID**  | \`$DEPLOY_ID\` |"
+            echo "| **Components** | $COMP_TOT deployed, $COMP_ERR error(s) |"
+            echo "| **Branch**     | \`${{ github.ref_name }}\` |"
+            echo "| **Commit**     | \`$(echo ${{ github.sha }} | cut -c1-8)\` |"
+            echo "| **Triggered by** | ${{ github.actor }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
+          if [ "$COMP_ERR" -gt 0 ]; then
+            echo "❌ QA deploy failed — $COMP_ERR component error(s)"
+            exit 1
+          fi
+          echo "✅ QA deploy succeeded"
+
+      - name: Upload QA deploy artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-deploy-${{ github.run_id }}
+          path: deploy_output.json
+          retention-days: 14
